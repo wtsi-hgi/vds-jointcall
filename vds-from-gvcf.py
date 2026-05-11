@@ -11,7 +11,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+
 import hail as hl
 
 GVCF_SUFFIXES = (".g.vcf.gz", ".g.vcf.bgz")
@@ -81,7 +81,7 @@ def prepare_output_path(path: str, overwrite: bool) -> None:
     if not path_exists(path):
         return
     if not overwrite:
-        LOGGER.warn(f"Output path already exists: {path}. Use --overwrite to replace it.")
+        LOGGER.warning(f"Output path already exists: {path}. Use --overwrite to replace it.")
         return
     LOGGER.info("Removing existing output path: %s", path)
     remove_path(path)
@@ -238,7 +238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     gvcfs = discover_gvcfs(config.gvcf_dir, config.recursive)
     LOGGER.info(f"=== Discovered {len(gvcfs)} gVCF file(s)" )
     init_hail(config)
-    LOGGER.info(f"=== Hail initialized" )
+    LOGGER.info("=== Hail initialized" )
     shard_paths = create_shard_vds(gvcfs, config)
     merge_shards(shard_paths, config)
 

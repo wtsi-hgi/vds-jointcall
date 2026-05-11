@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$PWD/.uv-cache}"
+
+if command -v pre-commit >/dev/null 2>&1; then
+    exec pre-commit run --hook-stage pre-commit
+fi
+
+exec uv run pre-commit run --hook-stage pre-commit
