@@ -12,13 +12,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
-
 import hail as hl
-
 
 GVCF_SUFFIXES = (".g.vcf.gz", ".g.vcf.bgz")
 LOGGER = logging.getLogger("vds-from-gvcf")
-
 
 @dataclass(slots=True, frozen=True)
 class Config:
@@ -29,13 +26,9 @@ class Config:
     gvcf_batch_size: int
     reference: str
     tmp_dir: str | None
-    use_exome_default_intervals: bool
+    whole_genome: bool
     recursive: bool
     overwrite: bool
-
-
-
-
 
 def positive_int(value: str) -> int:
     parsed = int(value)
@@ -73,91 +66,68 @@ def join_hail_path(base: str, *parts: str) -> str:
     return "/".join([normalized_base, *(part.strip("/") for part in parts)])
 
 
-def is_uri(path: str) -> bool:
-    return bool(urlparse(path).scheme)
-
-
 def path_exists(path: str) -> bool:
-    if is_uri(path):
-        return False
     return Path(path).exists()
 
 
 def remove_path(path: str) -> None:
-    if is_uri(path):
-        raise ValueError(f"Cannot delete URI path without Hail filesystem support: {path}")
-
     local_path = Path(path)
     if local_path.is_dir():
         shutil.rmtree(local_path)
     elif local_path.exists():
         local_path.unlink()
 
-
 def prepare_output_path(path: str, overwrite: bool) -> None:
     if not path_exists(path):
         return
     if not overwrite:
-        raise FileExistsError(f"Output path already exists: {path}. Use --overwrite to replace it.")
+        LOGGER.warn(f"Output path already exists: {path}. Use --overwrite to replace it.")
+        return
     LOGGER.info("Removing existing output path: %s", path)
     remove_path(path)
 
-
 def init_hail(config: Config):
     tmp_dir = config.tmp_dir or config.temp_vds_dir
-    LOGGER.info("Initializing Hail with reference=%s tmp_dir=%s", config.reference, tmp_dir)
+    LOGGER.info(f"=== Initializing Hail with reference={config.reference} tmp_dir={tmp_dir}")
     hl.init(tmp_dir=tmp_dir)
     hl.default_reference(config.reference)
 
-def run_combiner(
+def combine_gvcfs(
     config: Config,
     output_path: str,
     temp_path: str,
     save_path: str,
-    gvcf_paths: Sequence[str] | None = None,
-    vds_paths: Sequence[str] | None = None,
+    gvcf_paths: Sequence[str],
 
 ) -> None:
     prepare_output_path(output_path, config.overwrite)
     prepare_output_path(save_path, config.overwrite)
 
     start = time.monotonic()
-    if gvcf_paths is not None:
-        LOGGER.info("Combining %d gVCFs into %s", len(gvcf_paths), output_path)
-        combiner = hl.vds.new_combiner(
-            output_path=output_path,
-            gvcf_paths=list(gvcf_paths),
-            temp_path=temp_path,
-            save_path=save_path,
-            use_exome_default_intervals=config.use_exome_default_intervals,
-            gvcf_batch_size=config.gvcf_batch_size,
-        )
-    elif vds_paths is not None:
-        LOGGER.info("Merging %d VDS shards into %s", len(vds_paths), output_path)
-        combiner = hl.vds.new_combiner(
-            output_path=output_path,
-            vds_paths=list(vds_paths),
-            temp_path=temp_path,
-            save_path=save_path,
-            use_exome_default_intervals=config.use_exome_default_intervals,
-        )
-    else:
-        raise ValueError("Either gvcf_paths or vds_paths must be provided")
-
+    LOGGER.info(f"=== Combining {len(gvcf_paths)} gVCFs into {output_path}")
+    combiner = hl.vds.new_combiner(
+        output_path=output_path,
+        gvcf_paths=list(gvcf_paths),
+        temp_path=temp_path,
+        save_path=save_path,
+        use_genome_default_intervals=config.whole_genome,
+        use_exome_default_intervals=(not config.whole_genome),
+        gvcf_batch_size=config.gvcf_batch_size,
+    )
     combiner.run()
-    LOGGER.info("Finished %s in %.1f seconds", output_path, time.monotonic() - start)
+    LOGGER.info(f"Finished {output_path} in {(time.monotonic() - start):.1f} seconds")
 
 
 def create_shard_vds(gvcfs: Sequence[str], config: Config) -> list[str]:
     shard_paths: list[str] = []
     shards = list(chunked(gvcfs, config.shard_size))
-    LOGGER.info("Split %d gVCFs into %d shard(s)", len(gvcfs), len(shards))
+    LOGGER.info(f"=== Split {len(gvcfs)} gVCFs into {len(shards)} shard(s) ===")
 
     for index, shard_gvcfs in enumerate(shards, start=1):
         shard_name = f"shard-{index:05d}.vds"
         shard_path = join_hail_path(config.temp_vds_dir, "shards", shard_name)
         save_path = join_hail_path(config.temp_vds_dir, "combiner-state", f"shard-{index:05d}")
-        run_combiner(
+        combine_gvcfs(    # The combiner reuses existing VDS, so we can rerun it.
             output_path=shard_path,
             temp_path=config.temp_vds_dir,
             save_path=save_path,
@@ -165,20 +135,24 @@ def create_shard_vds(gvcfs: Sequence[str], config: Config) -> list[str]:
             config=config,
         )
         shard_paths.append(shard_path)
-
     return shard_paths
 
 
-def merge_shards(hl, shard_paths: Sequence[str], config: Config) -> None:
+def merge_shards(shard_paths: list[str], config: Config) -> None:
     save_path = join_hail_path(config.temp_vds_dir, "combiner-state", "final-merge")
-    run_combiner(
-        hl,
+
+    LOGGER.info(f"=== Merging {len(shard_paths)} VDS shards into {config.output_vds} ===")
+    start = time.monotonic()
+    combiner = hl.vds.new_combiner(
         output_path=config.output_vds,
-        temp_path=config.temp_vds_dir,
-        save_path=save_path,
         vds_paths=shard_paths,
-        config=config,
+        save_path=save_path,
+        temp_path=config.temp_vds_dir,
+        use_genome_default_intervals=config.whole_genome,
+        use_exome_default_intervals=(not config.whole_genome),
     )
+    combiner.run()
+    LOGGER.info(f"Finished {config.output_vds} in {(time.monotonic() - start):.1f} seconds")
 
 
 def configure_logging() -> None:
@@ -252,7 +226,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         gvcf_batch_size=args.gvcf_batch_size,
         reference=args.reference,
         tmp_dir=args.tmp_dir,
-        use_exome_default_intervals=not args.whole_genome,
+        whole_genome=args.whole_genome,
         recursive=args.recursive,
         overwrite=args.overwrite,
     )
@@ -262,8 +236,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config = parse_args(argv)
     gvcfs = discover_gvcfs(config.gvcf_dir, config.recursive)
-    LOGGER.info("Discovered %d gVCF file(s)", len(gvcfs))
+    LOGGER.info(f"=== Discovered {len(gvcfs)} gVCF file(s)" )
     init_hail(config)
+    LOGGER.info(f"=== Hail initialized" )
     shard_paths = create_shard_vds(gvcfs, config)
     merge_shards(shard_paths, config)
 
