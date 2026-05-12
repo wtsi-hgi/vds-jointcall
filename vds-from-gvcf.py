@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import sys
 import time
@@ -29,6 +30,7 @@ class Config:
     call_fields: list[str]
     reference: str
     tmp_dir: Path | None
+    spark_memory: str
     whole_genome: bool
     recursive: bool
     overwrite: bool
@@ -49,6 +51,12 @@ def comma_separated_fields(value: str) -> list[str]:
     if not fields:
         raise argparse.ArgumentTypeError("must include at least one field")
     return fields
+
+
+def memory_size(value: str) -> str:
+    if value == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
 
 
 def discover_gvcfs(gvcf_dir: Path, recursive: bool) -> list[Path]:
@@ -106,7 +114,11 @@ def vds_stats(shard_path: Path) -> None:
 
 def init_hail(config: Config):
     tmp_dir = config.tmp_dir or config.temp_vds_dir
+    os.environ["PYSPARK_SUBMIT_ARGS"] = (
+        f"--driver-memory {config.spark_memory} --executor-memory {config.spark_memory} pyspark-shell"
+    )
     LOGGER.info(f"=== Initializing Hail with reference={config.reference} tmp_dir={tmp_dir}")
+    LOGGER.info(f"=== PYSPARK_SUBMIT_ARGS={os.environ['PYSPARK_SUBMIT_ARGS']}")
     hl.init(tmp_dir=str(tmp_dir))
     hl.default_reference(config.reference)
 
@@ -254,6 +266,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         help="Hail/Spark temporary directory. Defaults to temp_vds_dir.",
     )
     parser.add_argument(
+        "--spark-memory",
+        type=memory_size,
+        default="12G",
+        help="Spark driver and executor memory used in PYSPARK_SUBMIT_ARGS. Default: 12G.",
+    )
+    parser.add_argument(
         "--whole-genome",
         action="store_true",
         help="Do not use Hail's exome default intervals.",
@@ -279,6 +297,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         call_fields=args.call_fields,
         reference=args.reference,
         tmp_dir=args.tmp_dir,
+        spark_memory=args.spark_memory,
         whole_genome=args.whole_genome,
         recursive=args.recursive,
         overwrite=args.overwrite,
