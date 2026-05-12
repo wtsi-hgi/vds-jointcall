@@ -228,14 +228,15 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         help="Local folder containing gVCF files.",
     )
     parser.add_argument(
-        "temp_vds_dir",
-        type=Path,
-        help="Temporary folder where per-shard and merge-intermediate VDS outputs are written.",
-    )
-    parser.add_argument(
         "output_vds",
         type=Path,
         help="Final VDS output path.",
+    )
+    parser.add_argument(
+        "--temp-vds-dir",
+        type=Path,
+        default=None,
+        help="Temporary folder where per-shard and merge-intermediate VDS outputs are written.",
     )
     parser.add_argument(
         "--shard-size",
@@ -290,7 +291,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
 
     return Config(
         gvcf_dir=args.gvcf_dir,
-        temp_vds_dir=args.temp_vds_dir,
+        temp_vds_dir=args.temp_vds_dir if args.temp_vds_dir is not None
+            else args.gvcf_dir.with_suffix('.vds-combine'),
         output_vds=args.output_vds,
         shard_size=args.shard_size,
         gvcf_batch_size=args.gvcf_batch_size,
