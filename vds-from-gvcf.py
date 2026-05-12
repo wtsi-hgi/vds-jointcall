@@ -16,6 +16,7 @@ from pathlib import Path
 import hail as hl
 
 GVCF_SUFFIXES = (".g.vcf.gz", ".g.vcf.bgz")
+DEFAULT_CALL_FIELDS = []
 LOGGER = logging.getLogger("vds-from-gvcf")
 VDS_SUCCESS_MARKER_SUFFIX = ".success"
 
@@ -79,12 +80,6 @@ def chunked[T](items: Sequence[T], size: int) -> Iterable[list[T]]:
         yield list(items[start : start + size])
 
 
-def combiner_call_fields_kwargs(config: Config) -> dict[str, list[str]]:
-    if len(config.call_fields) == 0:
-        return {}
-    return {"call_fields": config.call_fields}
-
-
 def vds_success_marker_path(path: Path) -> Path:
     return path.parent / f"{path.name}{VDS_SUCCESS_MARKER_SUFFIX}"
 
@@ -140,7 +135,7 @@ def combine_gvcfs(
         use_genome_default_intervals=config.whole_genome,
         use_exome_default_intervals=(not config.whole_genome),
         gvcf_batch_size=config.gvcf_batch_size,
-        **combiner_call_fields_kwargs(config),
+        call_fields=config.call_fields,
     )
     combiner.run()
     mark_vds_success(output_path)
@@ -203,7 +198,7 @@ def merge_shards(shard_paths: list[Path], config: Config) -> None:
         temp_path=str(config.temp_vds_dir),
         use_genome_default_intervals=config.whole_genome,
         use_exome_default_intervals=(not config.whole_genome),
-        **combiner_call_fields_kwargs(config),
+        call_fields=config.call_fields,
     )
     combiner.run()
     mark_vds_success(config.output_vds)
@@ -296,7 +291,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         output_vds=args.output_vds,
         shard_size=args.shard_size,
         gvcf_batch_size=args.gvcf_batch_size,
-        call_fields=args.call_fields,
+        call_fields=args.call_fields if len(args.call_fields) > 0 else DEFAULT_CALL_FIELDS,
         reference=args.reference,
         tmp_dir=args.tmp_dir,
         spark_memory=args.spark_memory,
