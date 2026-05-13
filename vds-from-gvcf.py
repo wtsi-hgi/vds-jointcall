@@ -148,7 +148,7 @@ def create_shard_vds(gvcfs: list[Path], config: Config) -> list[Path]:
     LOGGER.info(f"=== Split {len(gvcfs)} gVCFs into {len(shards)} shard(s) ===")
 
     for index, shard_gvcfs in enumerate(shards, start=1):
-        shard_name = f"shard-{index:05d}.vds"
+        shard_name = f"shard-{index:005d}.vds"
         shard_path = config.temp_vds_dir / "shards" / shard_name
         save_path = config.temp_vds_dir / "combiner-state" / f"shard-{index:05d}"
 
@@ -236,14 +236,14 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     parser.add_argument(
         "--shard-size",
         type=positive_int,
-        default=5,
+        default=50,
         help="Number of gVCFs per shard VDS.",
     )
     parser.add_argument(
         "--gvcf-batch-size",
         type=positive_int,
-        default=5,
-        help="gVCF batch size passed to Hail's combiner.",
+        default=25,
+        help="gVCF batch size passed to Hail's combiner. Whne <= --shard-size, Hail runs its own batching internally.",
     )
     parser.add_argument(
         "--call-fields",
