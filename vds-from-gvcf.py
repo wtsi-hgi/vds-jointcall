@@ -70,12 +70,6 @@ def comma_separated_fields(value: str) -> list[str]:
     return fields
 
 
-def memory_size(value: str) -> str:
-    if value == "":
-        raise argparse.ArgumentTypeError("must not be empty")
-    return value
-
-
 def discover_gvcfs(gvcf_dir: Path, recursive: bool) -> list[Path]:
     if not gvcf_dir.exists():
         raise FileNotFoundError(f"gVCF folder does not exist: {gvcf_dir}")
@@ -249,11 +243,14 @@ def vds_stats(shard_path: Path) -> None:
 
 def init_hail(config: Config):
     tmp_dir = config.tmp_dir or config.temp_vds_dir
-    os.environ["PYSPARK_SUBMIT_ARGS"] = (
-        f"--driver-memory {config.spark_memory} --executor-memory {config.spark_memory} pyspark-shell"
-    )
+    if config.spark_memory != "":
+        os.environ["PYSPARK_SUBMIT_ARGS"] = (
+            f"--driver-memory {config.spark_memory} --executor-memory {config.spark_memory} pyspark-shell"
+        )
+        LOGGER.info(f"=== PYSPARK_SUBMIT_ARGS={os.environ['PYSPARK_SUBMIT_ARGS']}")
+        LOGGER.info("=== Skipping PYSPARK_SUBMIT_ARGS because Spark memory option is empty")
+
     LOGGER.info(f"=== Initializing Hail with reference={config.reference} tmp_dir={tmp_dir}")
-    LOGGER.info(f"=== PYSPARK_SUBMIT_ARGS={os.environ['PYSPARK_SUBMIT_ARGS']}")
     hl.init(tmp_dir=hail_file_uri(tmp_dir))
     hl.default_reference(config.reference)
 
@@ -560,10 +557,14 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         help="Hail/Spark temporary directory. Defaults to temp_vds_dir.",
     )
     parser.add_argument(
+        "-M",
         "--spark-memory",
-        type=memory_size,
-        default="12G",
-        help="Spark driver and executor memory used in PYSPARK_SUBMIT_ARGS. Default: 12G.",
+        type=str,
+        default="",
+        help=(
+            "Spark driver and executor memory used in PYSPARK_SUBMIT_ARGS. "
+            "Use an empty value to skip setting it."
+        ),
     )
     parser.add_argument(
         "--whole-genome",
