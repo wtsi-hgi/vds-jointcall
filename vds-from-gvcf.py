@@ -54,6 +54,30 @@ class GvcfInput:
     mtime: float
 
 
+@dataclass(slots=True, frozen=True)
+class CompletedShard:
+    path: Path
+    gvcfs: list[GvcfInput]
+
+
+@dataclass(slots=True, frozen=True)
+class PendingShard:
+    output_path: Path
+    save_path: Path
+    gvcfs: list[GvcfInput]
+
+
+@dataclass(slots=True, frozen=True)
+class CombinationPlan:
+    reused_shards: list[CompletedShard]
+    pending_shards: list[PendingShard]
+    missing_from_current: list[GvcfInput]
+
+    @property
+    def shard_paths(self) -> list[Path]:
+        return [shard.path for shard in self.reused_shards] + [shard.output_path for shard in self.pending_shards]
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -130,7 +154,7 @@ def validate_unique_current_inputs(gvcfs: Sequence[GvcfInput]) -> None:
     duplicate_sample_ids = find_duplicates(gvcf.sample_id for gvcf in gvcfs)
     duplicate_names = find_duplicates(gvcf.filename for gvcf in gvcfs)
     if duplicate_sample_ids:
-        ValueError(f"Ambiguous gVCF sample IDs detected: {', '.join(duplicate_sample_ids)}")
+        raise ValueError(f"Ambiguous gVCF sample IDs detected: {', '.join(duplicate_sample_ids)}")
     if duplicate_names:
         raise ValueError(f"Ambiguous gVCF names detected: {', '.join(duplicate_names)}")
 
@@ -241,13 +265,14 @@ def vds_stats(shard_path: Path) -> None:
     vds.variant_data.entry.describe()
 
 
-def init_hail(config: Config):
+def init_hail(config: Config) -> None:
     tmp_dir = config.tmp_dir or config.temp_vds_dir
     if config.spark_memory != "":
         os.environ["PYSPARK_SUBMIT_ARGS"] = (
             f"--driver-memory {config.spark_memory} --executor-memory {config.spark_memory} pyspark-shell"
         )
         LOGGER.info(f"=== PYSPARK_SUBMIT_ARGS={os.environ['PYSPARK_SUBMIT_ARGS']}")
+    else:
         LOGGER.info("=== Skipping PYSPARK_SUBMIT_ARGS because Spark memory option is empty")
 
     LOGGER.info(f"=== Initializing Hail with reference={config.reference} tmp_dir={tmp_dir}")
@@ -307,7 +332,7 @@ def gvcf_input_from_manifest(data: dict[str, Any], manifest_path: Path) -> GvcfI
         raise ValueError(f"Invalid gVCF entry in manifest {manifest_path}: {data!r}") from error
 
 
-def load_shard_manifest(manifest_path: Path, config: Config) -> tuple[Path, list[GvcfInput]]:
+def load_shard_manifest(manifest_path: Path, config: Config) -> CompletedShard:
     shard_path = shard_path_from_manifest_path(manifest_path)
     if not shard_path.exists():
         raise ValueError(f"Shard manifest exists but VDS path is missing: {manifest_path} -> {shard_path}")
@@ -328,15 +353,15 @@ def load_shard_manifest(manifest_path: Path, config: Config) -> tuple[Path, list
             raise ValueError(f"Invalid gVCF entry in manifest {manifest_path}: {item!r}")
         gvcfs.append(gvcf_input_from_manifest(item, manifest_path))
     validate_unique_current_inputs(gvcfs)
-    return shard_path, gvcfs
+    return CompletedShard(path=shard_path, gvcfs=gvcfs)
 
 
-def load_completed_shards(config: Config) -> list[tuple[Path, list[GvcfInput]]]:
+def load_completed_shards(config: Config) -> list[CompletedShard]:
     shards_dir = config.temp_vds_dir / "shards"
     if not shards_dir.exists():
         return []
 
-    completed_shards: list[tuple[Path, list[GvcfInput]]] = []
+    completed_shards: list[CompletedShard] = []
     for manifest_path in sorted(shards_dir.glob(f"*.vds{VDS_SUCCESS_MARKER_SUFFIX}")):
         completed_shards.append(load_shard_manifest(manifest_path, config))
     return completed_shards
@@ -359,15 +384,15 @@ def remove_incomplete_shards(config: Config) -> None:
 
 def validate_completed_shards(
     current_gvcfs: Sequence[GvcfInput],
-    completed_shards: Sequence[tuple[Path, list[GvcfInput]]],
+    completed_shards: Sequence[CompletedShard],
 ) -> tuple[list[GvcfInput], list[GvcfInput]]:
     current_by_sample = {gvcf.sample_id: gvcf for gvcf in current_gvcfs}
     current_by_name = {gvcf.filename: gvcf for gvcf in current_gvcfs}
     completed_by_sample: dict[str, GvcfInput] = {}
     completed_by_name: dict[str, GvcfInput] = {}
 
-    for _shard_path, shard_gvcfs in completed_shards:
-        for gvcf in shard_gvcfs:
+    for shard in completed_shards:
+        for gvcf in shard.gvcfs:
             if gvcf.sample_id in completed_by_sample:
                 raise ValueError(f"Duplicate sample ID across completed shards: {gvcf.sample_id}")
             if gvcf.filename in completed_by_name:
@@ -406,17 +431,35 @@ def prepare_overwrite(config: Config) -> None:
     remove_path(vds_success_marker_path(config.output_vds))
 
 
-def create_shard_vds(gvcfs: list[GvcfInput], config: Config) -> list[Path]:
+def load_and_validate_gvcf_inputs(config: Config) -> list[GvcfInput]:
+    gvcf_paths = discover_gvcfs(config.gvcf_dir, config.recursive)
+    LOGGER.info("=== Discovered %s gVCF file(s)", len(gvcf_paths))
+    gvcfs = build_gvcf_inputs(gvcf_paths)
+    LOGGER.info("=== Loaded and validated %s gVCF sample(s)", len(gvcfs))
+    return gvcfs
+
+
+def prepare_existing_outputs(config: Config) -> None:
     if config.overwrite:
         LOGGER.info("=== Removing existing combiner state because --overwrite was requested ===")
         prepare_overwrite(config)
 
-    LOGGER.info(f"=== Found {len(gvcfs)} samples to combine ===")
+
+def load_and_validate_existing_shards(config: Config) -> list[CompletedShard]:
     remove_incomplete_shards(config)
     completed_shards = load_completed_shards(config)
-    LOGGER.info(f"=== Loaded {len(completed_shards)} completed shard(s) from previous run(s) ===")
-    new_gvcfs, missing_from_current = validate_completed_shards(gvcfs, completed_shards)
-    LOGGER.info(f"=== New gVCFs to combine: {len(new_gvcfs)} ===")
+    LOGGER.info("=== Loaded and validated %s completed shard(s) from previous run(s)", len(completed_shards))
+    return completed_shards
+
+
+def identify_samples_to_combine(
+    current_gvcfs: Sequence[GvcfInput],
+    completed_shards: Sequence[CompletedShard],
+    config: Config,
+) -> CombinationPlan:
+    LOGGER.info("=== Current input contains %s validated sample(s)", len(current_gvcfs))
+    new_gvcfs, missing_from_current = validate_completed_shards(current_gvcfs, completed_shards)
+    LOGGER.info("=== New gVCFs to combine: %s", len(new_gvcfs))
     for missing in missing_from_current:
         LOGGER.warning(
             "!!! Completed shard sample is absent from current input but will be included in final merge: "
@@ -425,29 +468,38 @@ def create_shard_vds(gvcfs: list[GvcfInput], config: Config) -> list[Path]:
             missing.filename,
         )
 
-    shard_paths = [shard_path for shard_path, _ in completed_shards]
     shards = list(chunked(new_gvcfs, config.shard_size))
-    LOGGER.info("=== Reusing %s completed shard(s) ===", len(completed_shards))
-    LOGGER.info(f"=== Split {len(new_gvcfs)} new gVCFs into {len(shards)} shard(s) ===")
-
     next_index = next_shard_index(config.temp_vds_dir / "shards")
-    for shard_gvcfs in shards:
-        shard_path = new_shard_path(config, next_index)
-        save_path = shard_save_path(config, next_index)
-        next_index += 1
-
-        combine_gvcfs(  # The combiner reuses existing VDS, so we can rerun it.
-            output_path=shard_path,
-            temp_path=config.temp_vds_dir,
-            save_path=save_path,
+    pending_shards = [
+        PendingShard(
+            output_path=new_shard_path(config, index),
+            save_path=shard_save_path(config, index),
             gvcfs=shard_gvcfs,
+        )
+        for index, shard_gvcfs in enumerate(shards, start=next_index)
+    ]
+
+    LOGGER.info("=== Reusing %s completed shard(s)", len(completed_shards))
+    LOGGER.info("=== Split %s new gVCFs into %s pending shard(s)", len(new_gvcfs), len(pending_shards))
+
+    return CombinationPlan(
+        reused_shards=list(completed_shards),
+        pending_shards=pending_shards,
+        missing_from_current=missing_from_current,
+    )
+
+
+def create_pending_shard_vds(plan: CombinationPlan, config: Config) -> None:
+    for shard in plan.pending_shards:
+        combine_gvcfs(  # The combiner reuses existing VDS, so we can rerun it.
+            output_path=shard.output_path,
+            temp_path=config.temp_vds_dir,
+            save_path=shard.save_path,
+            gvcfs=shard.gvcfs,
             config=config,
         )
-        shard_paths.append(shard_path)
         if config.verbose:
-            vds_stats(shard_path)
-
-    return shard_paths
+            vds_stats(shard.output_path)
 
 
 def merge_shards(shard_paths: list[Path], config: Config) -> None:
@@ -538,7 +590,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         "--gvcf-batch-size",
         type=positive_int,
         default=25,
-        help="gVCF batch size passed to Hail's combiner. Whne <= --shard-size, Hail runs its own batching internally.",
+        help="gVCF batch size passed to Hail's combiner. When <= --shard-size, Hail runs its own batching internally.",
     )
     parser.add_argument(
         "--call-fields",
@@ -585,8 +637,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
 
     return Config(
         gvcf_dir=args.gvcf_dir,
-        temp_vds_dir=args.temp_vds_dir if args.temp_vds_dir is not None
-            else args.gvcf_dir.with_suffix('.vds-combine'),
+        temp_vds_dir=args.temp_vds_dir if args.temp_vds_dir is not None else args.gvcf_dir.with_suffix(".vds-combine"),
         output_vds=args.output_vds,
         shard_size=args.shard_size,
         gvcf_batch_size=args.gvcf_batch_size,
@@ -604,13 +655,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
 
     config = parse_args(argv)
-    gvcfs = discover_gvcfs(config.gvcf_dir, config.recursive)
-    LOGGER.info(f"=== Discovered {len(gvcfs)} gVCF file(s)")
-    gvcf_inputs = build_gvcf_inputs(gvcfs)
+
+    # Stage 1: load and validate the current gVCF input list.
+    gvcf_inputs = load_and_validate_gvcf_inputs(config)
+
+    # Stage 2: load and validate reusable shard state from earlier runs.
+    prepare_existing_outputs(config)
+    completed_shards = load_and_validate_existing_shards(config)
+
+    # Stage 3: decide which samples need new shard VDS creation.
+    combination_plan = identify_samples_to_combine(
+        current_gvcfs=gvcf_inputs,
+        completed_shards=completed_shards,
+        config=config,
+    )
+
+    # Stage 4: run the Hail VDS work.
     init_hail(config)
-    LOGGER.info("=== Hail initialized")
-    shard_paths = create_shard_vds(gvcf_inputs, config)
-    merge_shards(shard_paths, config)
+    create_pending_shard_vds(combination_plan, config)
+    merge_shards(combination_plan.shard_paths, config)
 
     LOGGER.info("VDS build completed successfully: %s", config.output_vds)
     return 0
