@@ -22,7 +22,7 @@ GVCF_SUFFIXES = (".g.vcf.gz", ".g.vcf.bgz")
 DEFAULT_CALL_FIELDS = []
 LOGGER = logging.getLogger("vds-from-gvcf")
 VDS_SUCCESS_MARKER_SUFFIX = ".success"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 SHARD_MANIFEST_TYPE = "vds-jointcall-shard"
 FINAL_MANIFEST_TYPE = "vds-jointcall-final"
 SHARD_NAME_RE = re.compile(r"^shard-(\d{5})\.vds(?:\.success)?$")
@@ -47,8 +47,7 @@ class Config:
 
 @dataclass(slots=True, frozen=True)
 class GvcfInput:
-    normalized_name: str
-    basename: str
+    filename: str
     path: str
     sample_id: str
     size: int
@@ -109,8 +108,7 @@ def read_gvcf_sample_id(path: Path) -> str:
 def gvcf_input_from_path(path: Path) -> GvcfInput:
     stat = path.stat()
     return GvcfInput(
-        normalized_name=path.name,
-        basename=path.name,
+        filename=path.name,
         path=str(path),
         sample_id=read_gvcf_sample_id(path),
         size=stat.st_size,
@@ -136,7 +134,7 @@ def find_duplicates(values: Iterable[str]) -> list[str]:
 
 def validate_unique_current_inputs(gvcfs: Sequence[GvcfInput]) -> None:
     duplicate_sample_ids = find_duplicates(gvcf.sample_id for gvcf in gvcfs)
-    duplicate_names = find_duplicates(gvcf.normalized_name for gvcf in gvcfs)
+    duplicate_names = find_duplicates(gvcf.filename for gvcf in gvcfs)
     if duplicate_sample_ids:
         ValueError(f"Ambiguous gVCF sample IDs detected: {', '.join(duplicate_sample_ids)}")
     if duplicate_names:
@@ -180,7 +178,6 @@ def combiner_config_manifest(config: Config) -> dict[str, Any]:
         "whole_genome": config.whole_genome,
         "call_fields": config.call_fields,
         "shard_size": config.shard_size,
-        "hail_version": getattr(hl, "__version__", "unknown"),
         "schema_version": MANIFEST_SCHEMA_VERSION,
     }
 
@@ -293,14 +290,13 @@ def shard_manifest(shard_path: Path, gvcfs: Sequence[GvcfInput], config: Config)
 
 
 def gvcf_input_from_manifest(data: dict[str, Any], manifest_path: Path) -> GvcfInput:
-    required = ("normalized_name", "basename", "path", "sample_id", "size", "mtime")
+    required = ("filename", "path", "sample_id", "size", "mtime")
     missing = [key for key in required if key not in data]
     if missing:
         raise ValueError(f"Manifest entry in {manifest_path} missing fields: {', '.join(missing)}")
     try:
         return GvcfInput(
-            normalized_name=str(data["normalized_name"]),
-            basename=str(data["basename"]),
+            filename=str(data["filename"]),
             path=str(data["path"]),
             sample_id=str(data["sample_id"]),
             size=int(data["size"]),
@@ -365,7 +361,7 @@ def validate_completed_shards(
     completed_shards: Sequence[tuple[Path, list[GvcfInput]]],
 ) -> tuple[list[GvcfInput], list[GvcfInput]]:
     current_by_sample = {gvcf.sample_id: gvcf for gvcf in current_gvcfs}
-    current_by_name = {gvcf.normalized_name: gvcf for gvcf in current_gvcfs}
+    current_by_name = {gvcf.filename: gvcf for gvcf in current_gvcfs}
     completed_by_sample: dict[str, GvcfInput] = {}
     completed_by_name: dict[str, GvcfInput] = {}
 
@@ -373,27 +369,27 @@ def validate_completed_shards(
         for gvcf in shard_gvcfs:
             if gvcf.sample_id in completed_by_sample:
                 raise ValueError(f"Duplicate sample ID across completed shards: {gvcf.sample_id}")
-            if gvcf.normalized_name in completed_by_name:
-                raise ValueError(f"Duplicate gVCF file name across completed shards: {gvcf.normalized_name}")
+            if gvcf.filename in completed_by_name:
+                raise ValueError(f"Duplicate gVCF file name across completed shards: {gvcf.filename}")
             completed_by_sample[gvcf.sample_id] = gvcf
-            completed_by_name[gvcf.normalized_name] = gvcf
+            completed_by_name[gvcf.filename] = gvcf
 
             current_by_same_sample = current_by_sample.get(gvcf.sample_id)
-            current_by_same_name = current_by_name.get(gvcf.normalized_name)
-            if current_by_same_sample is not None and current_by_same_sample.normalized_name != gvcf.normalized_name:
+            current_by_same_name = current_by_name.get(gvcf.filename)
+            if current_by_same_sample is not None and current_by_same_sample.filename != gvcf.filename:
                 raise ValueError(
                     f"Ambiguous rename for sample {gvcf.sample_id}: completed name "
-                    f"{gvcf.normalized_name}, current name {current_by_same_sample.normalized_name}"
+                    f"{gvcf.filename}, current name {current_by_same_sample.filename}"
                 )
             if current_by_same_name is not None and current_by_same_name.sample_id != gvcf.sample_id:
                 raise ValueError(
-                    f"Ambiguous file name reuse for {gvcf.normalized_name}: completed sample "
+                    f"Ambiguous file name reuse for {gvcf.filename}: completed sample "
                     f"{gvcf.sample_id}, current sample {current_by_same_name.sample_id}"
                 )
             if current_by_same_sample is not None and (
                 current_by_same_sample.size != gvcf.size or current_by_same_sample.mtime != gvcf.mtime
             ):
-                raise ValueError(f"Changed-in-place gVCF detected for sample {gvcf.sample_id} ({gvcf.normalized_name})")
+                raise ValueError(f"Changed-in-place gVCF detected for sample {gvcf.sample_id} ({gvcf.filename})")
 
     missing_from_current = [
         gvcf for gvcf in completed_by_sample.values() if gvcf.sample_id not in current_by_sample
@@ -425,7 +421,7 @@ def create_shard_vds(gvcfs: list[GvcfInput], config: Config) -> list[Path]:
             "!!! Completed shard sample is absent from current input but will be included in final merge: "
             "%s (%s)",
             missing.sample_id,
-            missing.normalized_name,
+            missing.filename,
         )
 
     shard_paths = [shard_path for shard_path, _ in completed_shards]
