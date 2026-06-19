@@ -2,4 +2,4 @@
 set -e
 mem="12G"
 
-./vds-from-gvcf.py gVCFs_small/ vds_final_small --whole-genome --spark-memory "$mem"
+python vds-from-gvcf.py gVCFs_small vds_small --whole-genome --shard-size 4

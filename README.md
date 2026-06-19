@@ -1,4 +1,4 @@
-# vds-jointcall
+# VDS-Jointcall
 
 VDS-jointcall is a tool that makes joint calling of WGS/WES samples using Hail VDS format.
 
