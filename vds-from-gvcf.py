@@ -157,6 +157,10 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
+def hail_file_uri(path: Path | str) -> str:
+    return Path(path).resolve().as_uri()
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -237,7 +241,7 @@ def shard_save_path(config: Config, index: int) -> Path:
 
 
 def vds_stats(shard_path: Path) -> None:
-    vds = hl.vds.read_vds(str(shard_path))
+    vds = hl.vds.read_vds(hail_file_uri(shard_path))
     print(vds.variant_data.count())  # Count variants (rows x samples)
     vds.variant_data.rows().describe()  # Schema of variant table
     vds.variant_data.entry.describe()
@@ -250,7 +254,7 @@ def init_hail(config: Config):
     )
     LOGGER.info(f"=== Initializing Hail with reference={config.reference} tmp_dir={tmp_dir}")
     LOGGER.info(f"=== PYSPARK_SUBMIT_ARGS={os.environ['PYSPARK_SUBMIT_ARGS']}")
-    hl.init(tmp_dir=str(tmp_dir))
+    hl.init(tmp_dir=hail_file_uri(tmp_dir))
     hl.default_reference(config.reference)
 
 
@@ -264,10 +268,10 @@ def combine_gvcfs(
     start = time.monotonic()
     LOGGER.info(f"=== Combining {len(gvcfs)} gVCFs into {output_path}")
     combiner = hl.vds.new_combiner(
-        output_path=str(output_path),
-        gvcf_paths=[gvcf.path for gvcf in gvcfs],
-        temp_path=str(temp_path),
-        save_path=str(save_path),
+        output_path=hail_file_uri(output_path),
+        gvcf_paths=[hail_file_uri(gvcf.path) for gvcf in gvcfs],
+        temp_path=hail_file_uri(temp_path),
+        save_path=hail_file_uri(save_path),
         use_genome_default_intervals=config.whole_genome,
         use_exome_default_intervals=(not config.whole_genome),
         gvcf_batch_size=config.gvcf_batch_size,
@@ -459,10 +463,10 @@ def merge_shards(shard_paths: list[Path], config: Config) -> None:
     LOGGER.info(f"=== Merging {len(shard_paths)} VDS shards into {config.output_vds} ===")
     start = time.monotonic()
     combiner = hl.vds.new_combiner(
-        output_path=str(config.output_vds),
-        vds_paths=[str(path) for path in shard_paths],
-        save_path=str(save_path),
-        temp_path=str(config.temp_vds_dir),
+        output_path=hail_file_uri(config.output_vds),
+        vds_paths=[hail_file_uri(path) for path in shard_paths],
+        save_path=hail_file_uri(save_path),
+        temp_path=hail_file_uri(config.temp_vds_dir),
         use_genome_default_intervals=config.whole_genome,
         use_exome_default_intervals=(not config.whole_genome),
         call_fields=config.call_fields,
