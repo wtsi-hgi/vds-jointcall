@@ -74,7 +74,13 @@ def init_hail(config: Config) -> None:
         LOGGER.info("=== Skipping PYSPARK_SUBMIT_ARGS because Spark memory option is empty")
 
     LOGGER.info("=== Initializing Hail with reference=%s tmp_dir=%s", config.reference, config.tmp_dir)
-    hl.init(tmp_dir=hail_path(config.tmp_dir))
+    hl.init(
+        tmp_dir=hail_path(config.tmp_dir),
+        spark_conf={
+            'spark.rpc.message.maxSize': '1024',   # Required for VDS export for large datasets
+            'spark.driver.maxResultSize': '0'  # 0 means unlimited; prevents driver OOMs during large collections
+        }
+    )
     hl.default_reference(config.reference)
 
     if config.reference_sequence is not None:
