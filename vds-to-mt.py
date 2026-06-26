@@ -162,12 +162,12 @@ def matrix_table_from_vds(config: Config) -> hl.MatrixTable:
     LOGGER.info("=== Splitting multi-allelic sites")
     mt = hl.split_multi_hts(mt)
     if config.count_variants:
-        LOGGER.info("=== Total variants in MT after split_multi_hts", mt.count_rows())
+        LOGGER.info(f"=== Total variants in MT after split_multi_hts {mt.count_rows()}")
 
     LOGGER.info("=== Filtering to sites with at least one non-reference genotype")
     mt = mt.filter_rows(hl.agg.any(mt.GT.is_non_ref()))
     if config.count_variants:
-        LOGGER.info("=== Total variants in MT after non-reference filter", mt.count_rows())
+        LOGGER.info(f"=== Total variants in MT after non-reference filter {mt.count_rows()}")
 
     if config.drop_gvcf_info:
         mt = drop_existing_fields(mt, ["gvcf_info"])
@@ -244,9 +244,9 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         help="Keep the gvcf_info row field in the output MatrixTable. Can cause issues with exporting VCFs. Default: False.",
     )
     parser.add_argument(
-        "--skip-counts",
+        "--count_variants",
         action="store_true",
-        help="Skip variant count logging. This avoids extra Hail actions on large datasets.",
+        help="Log the number of variations after each step. Increases processing time on large datasets.",
     )
     parser.add_argument(
         "--overwrite",
@@ -269,7 +269,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         spark_memory=args.spark_memory,
         max_alleles=args.max_alleles,
         drop_gvcf_info=not args.keep_gvcf_info,
-        count_variants=not args.skip_counts,
+        count_variants=args.count_variants,
         overwrite=args.overwrite,
         describe=args.describe,
     )
