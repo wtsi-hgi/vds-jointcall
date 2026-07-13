@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Export a single sample from a MatrixTable to a VCF file."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+import hail as hl
+
+LOGGER = logging.getLogger("mt-to-vcf-1sample")
+
+
+@dataclass(slots=True, frozen=True)
+class Config:
+    input_mt: str
+    output_vcf: str
+    sample_id: str
+    reference: str
+    tmp_dir: str
+    spark_memory: str
+    overwrite: bool
+
+
+def has_uri_scheme(path: str) -> bool:
+    return urlparse(path).scheme != ""
+
+
+def hail_path(path: str) -> str:
+    if has_uri_scheme(path):
+        return path
+    return Path(path).resolve().as_uri()
+
+
+def local_path(path: str) -> Path | None:
+    if has_uri_scheme(path):
+        return None
+    return Path(path)
+
+
+def init_hail(config: Config) -> None:
+    if config.spark_memory != "":
+        os.environ["PYSPARK_SUBMIT_ARGS"] = (
+            f"--driver-memory {config.spark_memory} --executor-memory {config.spark_memory} pyspark-shell"
+        )
+        LOGGER.info("=== PYSPARK_SUBMIT_ARGS=%s", os.environ["PYSPARK_SUBMIT_ARGS"])
+    else:
+        LOGGER.info("=== Skipping PYSPARK_SUBMIT_ARGS because Spark memory option is empty")
+
+    LOGGER.info("=== Initializing Hail with reference=%s tmp_dir=%s", config.reference, config.tmp_dir)
+    hl.init(
+        tmp_dir=hail_path(config.tmp_dir),
+        spark_conf={
+            'spark.rpc.message.maxSize': '1024',
+            'spark.driver.maxResultSize': '0'
+        }
+    )
+    hl.default_reference(config.reference)
+
+
+def validate_paths(config: Config) -> None:
+    input_mt = local_path(config.input_mt)
+    if input_mt is not None:
+        if not input_mt.exists():
+            raise FileNotFoundError(f"Input MatrixTable does not exist: {input_mt}")
+
+    output_vcf = local_path(config.output_vcf)
+    if output_vcf is not None:
+        if output_vcf.exists() and not config.overwrite:
+            raise FileExistsError(f"Output VCF already exists, use --overwrite to replace it: {output_vcf}")
+        output_vcf.parent.mkdir(parents=True, exist_ok=True)
+
+
+def export_vcf(config: Config) -> None:
+    LOGGER.info("=== Reading MatrixTable: %s", config.input_mt)
+    mt = hl.read_matrix_table(hail_path(config.input_mt))
+
+    LOGGER.info("=== Filtering to sample: %s", config.sample_id)
+    # Filter columns (samples)
+    mt = mt.filter_cols(mt.s == config.sample_id)
+    
+    # Check if sample exists
+    if mt.count_cols() == 0:
+        print(f"!!! WARNING: Sample '{config.sample_id}' not found in MatrixTable.")
+
+    # Filter out rows (variants) where the sample doesn't have a non-reference genotype if desired, 
+    # but here we don't do it because we want to save VCF with all positions from all samples.
+    # We filter matrixtable only to reduce the size of the output.
+
+    LOGGER.info("=== Exporting to VCF: %s", config.output_vcf)
+    hl.export_vcf(mt, hail_path(config.output_vcf), parallel='header_per_shard')
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def parse_args(argv: Sequence[str] | None = None) -> Config:
+    parser = argparse.ArgumentParser(
+        description="Export a single sample from a Hail MatrixTable to a VCF file.",
+    )
+    parser.add_argument(
+        "input_mt",
+        help="Input Hail MatrixTable path or URI.",
+    )
+    parser.add_argument(
+        "output_vcf",
+        help="Output VCF path or URI.",
+    )
+    parser.add_argument(
+        "--sample-id",
+        default="NA18978",
+        help="Sample ID to extract. Default: NA18978.",
+    )
+    parser.add_argument(
+        "--reference",
+        default="GRCh38",
+        help="Hail reference genome. Default: GRCh38.",
+    )
+    parser.add_argument(
+        "--tmp-dir",
+        default="hail-tmp",
+        help="Hail/Spark temporary directory path or URI. Default: hail-tmp.",
+    )
+    parser.add_argument(
+        "-M",
+        "--spark-memory",
+        type=str,
+        default="",
+        help=(
+            "Spark driver and executor memory used in PYSPARK_SUBMIT_ARGS. "
+            "Use an empty value to skip setting it."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing output VCF.",
+    )
+    args = parser.parse_args(argv)
+
+    return Config(
+        input_mt=args.input_mt,
+        output_vcf=args.output_vcf,
+        sample_id=args.sample_id,
+        reference=args.reference,
+        tmp_dir=args.tmp_dir,
+        spark_memory=args.spark_memory,
+        overwrite=args.overwrite,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    configure_logging()
+    config = parse_args(argv)
+    try:
+        validate_paths(config)
+        init_hail(config)
+        export_vcf(config)
+        LOGGER.info("VCF export completed successfully: %s", config.output_vcf)
+    except Exception as e:
+        LOGGER.error(str(e))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
