@@ -26,6 +26,7 @@ class Config:
     tmp_dir: str
     spark_memory: str
     overwrite: bool
+    num_partitions: int
 
 
 def has_uri_scheme(path: str) -> bool:
@@ -84,8 +85,10 @@ def export_vcf(config: Config) -> None:
     LOGGER.info("=== Filtering to sample: %s", config.sample_id)
     # Filter columns (samples)
     mt = mt.filter_cols(mt.s == config.sample_id)
+    mt = mt.drop('gvcf_info')
+    mt = mt.naive_coalesce(config.num_partitions)
     
-    # Check if sample exists
+    # Check if the sample exists
     if mt.count_cols() == 0:
         print(f"!!! WARNING: Sample '{config.sample_id}' not found in MatrixTable.")
 
@@ -94,7 +97,7 @@ def export_vcf(config: Config) -> None:
     # We filter matrixtable only to reduce the size of the output.
 
     LOGGER.info("=== Exporting to VCF: %s", config.output_vcf)
-    hl.export_vcf(mt, hail_path(config.output_vcf), parallel='header_per_shard')
+    hl.export_vcf(mt, hail_path(config.output_vcf))
 
 
 def configure_logging() -> None:
@@ -147,6 +150,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         action="store_true",
         help="Overwrite an existing output VCF.",
     )
+    parser.add_argument(
+        "--num-partitions",
+        type=int,
+        default=500,
+        help="Number of partitions to export VCF. Default: 500.",
+    )
     args = parser.parse_args(argv)
 
     return Config(
@@ -157,6 +166,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         tmp_dir=args.tmp_dir,
         spark_memory=args.spark_memory,
         overwrite=args.overwrite,
+        num_partitions=args.num_partitions,
     )
 
 
