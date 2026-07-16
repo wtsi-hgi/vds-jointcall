@@ -42,6 +42,7 @@ class Config:
     whole_genome: bool
     recursive: bool
     overwrite: bool
+    append_to: Path | None
     verbose: bool = False
 
 
@@ -502,18 +503,22 @@ def create_pending_shard_vds(plan: CombinationPlan, config: Config) -> None:
             vds_stats(shard.output_path)
 
 
-def merge_shards(shard_paths: list[Path], config: Config) -> None:
+def merge_shards(shard_paths: list[Path], config: Config, extra_vds_paths: list[Path] | None = None) -> None:
     save_path = config.temp_vds_dir / "combiner-state" / "final-merge"
     if save_path.exists():
         remove_path(save_path)
     remove_path(config.output_vds)
     remove_path(vds_success_marker_path(config.output_vds))
 
-    LOGGER.info(f"=== Merging {len(shard_paths)} VDS shards into {config.output_vds} ===")
+    all_vds_paths =[hail_file_uri(path) for path in shard_paths]
+    if extra_vds_paths is not None:
+        all_vds_paths += [hail_file_uri(p) for p in extra_vds_paths]
+    LOGGER.info(f"=== Merging {len(all_vds_paths)} VDS input(s) into {config.output_vds} ===")
+    print("=== Merging shards, ", all_vds_paths)
     start = time.monotonic()
     combiner = hl.vds.new_combiner(
         output_path=hail_file_uri(config.output_vds),
-        vds_paths=[hail_file_uri(path) for path in shard_paths],
+        vds_paths=all_vds_paths,
         save_path=hail_file_uri(save_path),
         temp_path=hail_file_uri(config.temp_vds_dir),
         use_genome_default_intervals=config.whole_genome,
@@ -521,13 +526,27 @@ def merge_shards(shard_paths: list[Path], config: Config) -> None:
         call_fields=config.call_fields,
     )
     combiner.run()
-    mark_vds_success(config.output_vds, final_manifest(shard_paths, config))
+    mark_vds_success(config.output_vds, final_manifest(shard_paths, config, extra_vds_paths))
     LOGGER.info(f"Finished {config.output_vds} in {(time.monotonic() - start):.1f} seconds")
 
 
-def final_manifest(shard_paths: Sequence[Path], config: Config) -> dict[str, Any]:
+def final_manifest(
+    shard_paths: Sequence[Path],
+    config: Config,
+    extra_vds_paths: list[Path] | None = None,
+) -> dict[str, Any]:
     shards = []
     sample_ids = []
+
+    # Include samples from appended VDS sources
+    for vds_path in (extra_vds_paths or []):
+        manifest_path = vds_success_marker_path(Path(vds_path) if not isinstance(vds_path, Path) else vds_path)
+        manifest = read_json(manifest_path)
+        for existing_shard in manifest.get("shards", []):
+            shards.append(existing_shard)
+            for gvcf in existing_shard.get("gvcfs", []):
+                sample_ids.append(str(gvcf["sample_id"]))
+
     for shard_path in shard_paths:
         manifest_path = vds_success_marker_path(shard_path)
         manifest = read_json(manifest_path)
@@ -547,6 +566,7 @@ def final_manifest(shard_paths: Sequence[Path], config: Config) -> dict[str, Any
         "output_vds": str(config.output_vds),
         "combiner_config": combiner_config_manifest(config),
         "shard_paths": [str(path) for path in shard_paths],
+        "appended_from": [str(p) for p in (extra_vds_paths or [])],
         "samples": sorted(sample_ids),
         "shards": shards,
     }
@@ -633,7 +653,21 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         action="store_true",
         help="Delete existing shard, intermediate, and final VDS paths before writing.",
     )
+    parser.add_argument(
+        "--append-to",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an existing combined VDS. New gVCFs not already present in this VDS "
+            "will be combined into shards and merged together with the existing VDS into output_vds."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.append_to is not None and args.overwrite:
+        parser.error("--append-to and --overwrite are mutually exclusive")
+    if args.append_to is not None and args.append_to.resolve() == args.output_vds.resolve():
+        parser.error("--append-to path must differ from output_vds")
 
     return Config(
         gvcf_dir=args.gvcf_dir,
@@ -648,7 +682,26 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         whole_genome=args.whole_genome,
         recursive=args.recursive,
         overwrite=args.overwrite,
+        append_to=args.append_to,
     )
+
+
+def load_append_to_samples(config: Config) -> set[str]:
+    append_to = config.append_to.resolve()
+    if not append_to.exists():
+        raise FileNotFoundError(f"--append-to VDS does not exist: {append_to}")
+    manifest_path = vds_success_marker_path(append_to)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"--append-to VDS has no success manifest: {manifest_path}")
+    manifest = read_json(manifest_path)
+    if manifest.get("manifest_type") != FINAL_MANIFEST_TYPE:
+        raise ValueError(f"--append-to manifest is not a final VDS manifest: {manifest_path}")
+    validate_manifest_config(manifest, config, manifest_path)
+    samples = manifest.get("samples", [])
+    if not isinstance(samples, list):
+        raise ValueError(f"Invalid samples list in manifest: {manifest_path}")
+    LOGGER.info("=== Existing VDS at %s contains %d sample(s)", append_to, len(samples))
+    return set(samples)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -658,6 +711,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Stage 1: load and validate the current gVCF input list.
     gvcf_inputs = load_and_validate_gvcf_inputs(config)
+
+    # Stage 1b: in append mode, filter out samples already in the existing VDS.
+    if config.append_to is not None:
+        existing_samples = load_append_to_samples(config)
+        if existing_samples:
+            before = len(gvcf_inputs)
+            gvcf_inputs = [g for g in gvcf_inputs if g.sample_id not in existing_samples]
+            LOGGER.info(
+                "=== Filtered gVCFs: %d total, %d already in existing VDS, %d new",
+                before, before - len(gvcf_inputs), len(gvcf_inputs),
+            )
+            if not gvcf_inputs:
+                LOGGER.info("=== All samples are already in the existing VDS. Nothing to do.")
+                return 0
 
     # Stage 2: load and validate reusable shard state from earlier runs.
     prepare_existing_outputs(config)
@@ -673,7 +740,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Stage 4: run the Hail VDS work.
     init_hail(config)
     create_pending_shard_vds(combination_plan, config)
-    merge_shards(combination_plan.shard_paths, config)
+
+    extra_vds_paths: list[Path] | None = None
+    if config.append_to is not None:
+        extra_vds_paths = [config.append_to.resolve()]
+    merge_shards(combination_plan.shard_paths, config, extra_vds_paths=extra_vds_paths)
 
     LOGGER.info("VDS build completed successfully: %s", config.output_vds)
     return 0
