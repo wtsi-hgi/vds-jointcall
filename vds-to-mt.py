@@ -157,7 +157,12 @@ def matrix_table_from_vds(config: Config) -> hl.MatrixTable:
     variant_data = annotate_variant_entries(vds)
 
     LOGGER.info("=== Creating merged sparse MatrixTable")
-    mt = hl.vds.to_merged_sparse_mt(hl.vds.VariantDataset(vds.reference_data, variant_data))
+    # The ref_allele_function is required to provide a default value for the reference-only alleles.
+    # We remove reference alleles before export, so it's safe to use missing('str') here.
+    mt = hl.vds.to_merged_sparse_mt(
+        hl.vds.VariantDataset(vds.reference_data, variant_data),
+        ref_allele_function=lambda locus: hl.missing('str'),
+    )
 
     LOGGER.info("=== Splitting multi-allelic sites")
     mt = hl.split_multi_hts(mt)
