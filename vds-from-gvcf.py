@@ -102,7 +102,16 @@ def discover_gvcfs(gvcf_dir: Path, recursive: bool) -> list[Path]:
         raise NotADirectoryError(f"gVCF path is not a folder: {gvcf_dir}")
 
     files: Iterable[Path]
-    files = gvcf_dir.rglob("*") if recursive else gvcf_dir.iterdir()
+    if recursive:
+        # Path.rglob does not follow symlinked directories before Python 3.13's
+        # so walk manually with followlinks=True instead.
+        files = (
+            Path(root) / name
+            for root, _dirs, names in os.walk(gvcf_dir, followlinks=True)
+            for name in names
+        )
+    else:
+        files = gvcf_dir.iterdir()
     gvcfs = sorted(path.resolve() for path in files if path.is_file() and path.name.lower().endswith(GVCF_SUFFIXES))
     if not gvcfs:
         suffixes = ", ".join(GVCF_SUFFIXES)
