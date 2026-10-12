@@ -1,14 +1,15 @@
 import argparse
 import os
+
 import hail as hl
 import pyspark
-from gnomad.utils.sparse_mt import (
-    get_as_info_expr,
-    get_site_info_expr,
-)
 from gnomad.utils.annotations import (
     annotate_adj,
     bi_allelic_site_inbreeding_expr,
+)
+from gnomad.utils.sparse_mt import (
+    get_as_info_expr,
+    get_site_info_expr,
 )
 
 
