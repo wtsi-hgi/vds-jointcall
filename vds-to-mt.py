@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Export a Hail Variant Dataset as a filtered sparse MatrixTable."""
+"""Export a Hail Variant Dataset as a filtered, annotated dense MatrixTable.
+
+The VDS is densified with ``hl.vds.to_dense_mt``, so samples covered by a reference block at a variant site
+get a hom-ref entry. Multi-allelic sites are kept (not split). Entry fields (GT, AD, PL, ...) are built from
+the VDS local fields and site-level ``info`` fields are aggregated as in ``annotate_vds.py``.
+"""
 
 from __future__ import annotations
 
@@ -12,11 +17,93 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 import hail as hl
 
 LOGGER = logging.getLogger("vds-to-mt")
+
+INFO_PREFIX = "info."
+LOCAL_FIELDS = ("LA", "LGT", "LAD", "LPL", "LPGT")
+ALT_ALLELES_RANGE_FIELD = "alt_alleles_range_array"
+# Temporary row fields holding the raw aggregation results before the final `info` struct is selected.
+SITE_INFO_FIELD = "_site_info"
+AS_INFO_FIELD = "_as_info"
+CALL_STATS_FIELD = "_call_stats"
+QD_FIELD = "_qd"
+DB_FIELD = "_db"
+SB_IS_GATK_FIELD = "_sb_is_gatk"
+# GATK FORMAT/SB: [ref_fwd, ref_rev, alt_fwd, alt_rev]. Some callers write a fwd/rev pair per allele instead.
+GATK_SB_LENGTH = 4
+
+
+@dataclass(slots=True, frozen=True)
+class Annotation:
+    name: str  # "AD" for an entry field, "info.QD" for a row info field
+    kind: Literal["entry", "info"]
+    sources: tuple[str, ...]  # required variant_data entry fields (top-level or inside gvcf_info)
+    group: str  # builder that computes it
+
+    @property
+    def field(self) -> str:
+        return self.name.removeprefix(INFO_PREFIX)
+
+
+ANNOTATIONS: tuple[Annotation, ...] = (
+    Annotation("GT", "entry", ("LGT", "LA"), "local_to_global"),
+    Annotation("AD", "entry", ("LAD", "LA"), "local_to_global"),
+    Annotation("PL", "entry", ("LPL", "LA"), "local_to_global"),
+    Annotation("PGT", "entry", ("LPGT", "LA"), "local_to_global"),
+    Annotation("DP", "entry", ("DP",), "passthrough"),
+    Annotation("GQ", "entry", ("GQ",), "passthrough"),
+    Annotation("MIN_DP", "entry", ("MIN_DP",), "passthrough"),
+    Annotation("PID", "entry", ("PID",), "passthrough"),
+    Annotation("PS", "entry", ("PS",), "passthrough"),
+    Annotation("RGQ", "entry", ("RGQ",), "passthrough"),
+    Annotation("SB", "entry", ("SB",), "passthrough"),
+    Annotation("info.DP", "info", ("DP",), "site_info"),
+    Annotation("info.ReadPosRankSum", "info", ("ReadPosRankSum",), "site_info"),
+    Annotation("info.MQRankSum", "info", ("MQRankSum",), "site_info"),
+    Annotation("info.BaseQRankSum", "info", ("BaseQRankSum",), "site_info"),
+    Annotation("info.MQ", "info", ("RAW_MQandDP",), "site_info"),
+    Annotation("info.FS", "info", ("SB",), "site_info"),
+    Annotation("info.SOR", "info", ("SB",), "site_info"),
+    Annotation("info.AS_MQ", "info", ("AS_RAW_MQ", "LAD", "LA"), "as_info"),
+    Annotation("info.AS_ReadPosRankSum", "info", ("AS_RAW_ReadPosRankSum", "LA"), "as_info"),
+    Annotation("info.AS_MQRankSum", "info", ("AS_RAW_MQRankSum", "LA"), "as_info"),
+    Annotation("info.AS_QD", "info", ("AS_QD", "LA"), "as_info"),
+    Annotation("info.AS_FS", "info", ("AS_SB_TABLE", "LA"), "as_info"),
+    Annotation("info.AS_SOR", "info", ("AS_SB_TABLE", "LA"), "as_info"),
+    Annotation("info.DB", "info", ("DB",), "db"),
+    # QD needs global PL, which the qd builder computes itself from LPL/LA (see qd_expr).
+    Annotation("info.QD", "info", ("LPL", "LA", "LGT", "DP"), "qd"),
+    Annotation("info.AN", "info", ("LGT", "LA"), "call_stats"),
+    Annotation("info.AC", "info", ("LGT", "LA"), "call_stats"),
+    Annotation("info.AF", "info", ("LGT", "LA"), "call_stats"),
+)
+ANNOTATIONS_BY_NAME = {annotation.name: annotation for annotation in ANNOTATIONS}
+DEFAULT_ANNOTATIONS = tuple(annotation.name for annotation in ANNOTATIONS)
+
+# Inputs of the gnomAD helpers: annotation name -> (helper aggregation argument, input field).
+# The helper output field is the annotation name without "info.".
+SITE_INFO_INPUTS: dict[str, tuple[str, str]] = {
+    "info.DP": ("int32_sum_agg_fields", "DP"),
+    "info.ReadPosRankSum": ("median_agg_fields", "ReadPosRankSum"),
+    "info.MQRankSum": ("median_agg_fields", "MQRankSum"),
+    "info.BaseQRankSum": ("median_agg_fields", "BaseQRankSum"),
+    "info.MQ": ("array_sum_agg_fields", "RAW_MQandDP"),  # gnomAD turns RAW_MQandDP into MQ
+    "info.FS": ("array_sum_agg_fields", "SB"),  # gnomAD derives FS and SOR from SB
+    "info.SOR": ("array_sum_agg_fields", "SB"),
+}
+AS_INFO_INPUTS: dict[str, tuple[str, str]] = {
+    "info.AS_MQ": ("sum_agg_fields", "AS_RAW_MQ"),  # gnomAD turns AS_RAW_MQ into AS_MQ
+    "info.AS_ReadPosRankSum": ("median_agg_fields", "AS_RAW_ReadPosRankSum"),
+    "info.AS_MQRankSum": ("median_agg_fields", "AS_RAW_MQRankSum"),
+    "info.AS_QD": ("median_agg_fields", "AS_QD"),
+    "info.AS_FS": ("array_sum_agg_fields", "AS_SB_TABLE"),  # gnomAD derives AS_FS and AS_SOR from AS_SB_TABLE
+    "info.AS_SOR": ("array_sum_agg_fields", "AS_SB_TABLE"),
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -32,6 +119,9 @@ class Config:
     count_variants: bool
     overwrite: bool
     describe: bool
+    annotations: tuple[str, ...]
+    strict_annotations: bool
+    fill_ref_dp: bool
 
 
 def positive_int(value: str) -> int:
@@ -39,6 +129,40 @@ def positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def annotation_list(value: str) -> tuple[str, ...]:
+    names = tuple(dict.fromkeys(name.strip() for name in value.split(",") if name.strip()))
+    if not names:
+        raise argparse.ArgumentTypeError("expected at least one annotation name")
+    unknown = [name for name in names if name not in ANNOTATIONS_BY_NAME]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown annotation(s): {', '.join(unknown)}. Use --list-annotations to see the available names."
+        )
+    return names
+
+
+def format_annotation_table() -> str:
+    rows = [("NAME", "KIND", "BUILDER", "REQUIRED SOURCES")]
+    rows += [(a.name, a.kind, a.group, ", ".join(a.sources)) for a in ANNOTATIONS]
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    return "\n".join(
+        f"{name:<{widths[0]}}  {kind:<{widths[1]}}  {group:<{widths[2]}}  {sources}"
+        for name, kind, group, sources in rows
+    )
+
+
+class ListAnnotationsAction(argparse.Action):
+    """Print the annotation registry and exit, without requiring positional arguments or starting Hail."""
+
+    def __call__(self, parser: argparse.ArgumentParser, *_args: object, **_kwargs: object) -> None:
+        print(format_annotation_table())
+        print(
+            "\nSources are looked up as top-level variant_data entry fields or inside gvcf_info "
+            "(local fields LA/LGT/LAD/LPL/LPGT must be top-level)."
+        )
+        parser.exit()
 
 
 def has_uri_scheme(path: str) -> bool:
@@ -122,28 +246,237 @@ def filter_vds_by_allele_count(
     sites_to_keep = variant_rows.filter(hl.len(variant_rows.alleles) <= max_alleles)
     filtered_vds = hl.vds.filter_variants(vds, sites_to_keep)
     if count_variants:
-        LOGGER.info(f"=== Total variants in VDS after filtering to <= {max_alleles} alleles: {filtered_vds.variant_data.count()}" )
+        LOGGER.info(
+            f"=== Total variants in VDS after filtering to <= {max_alleles} alleles: "
+            f"{filtered_vds.variant_data.count_rows()}"
+        )
     return filtered_vds
 
-def annotate_variant_entries(vds: hl.vds.VariantDataset) -> hl.MatrixTable:
-    variant_data = vds.variant_data.annotate_entries(
-        AD=hl.vds.local_to_global(
-            vds.variant_data.LAD,
-            vds.variant_data.LA,
-            n_alleles=hl.len(vds.variant_data.alleles),
-            fill_value=0,
-            number="R",
+
+def filter_vds_to_non_ref_sites(vds: hl.vds.VariantDataset, count_variants: bool) -> hl.vds.VariantDataset:
+    # Densifying takes reference blocks from reference_data, so dropping variant rows without a non-ref LGT
+    # before to_dense_mt gives the same result as filtering the dense MatrixTable, with less work.
+    variant_data = vds.variant_data
+    variant_data = variant_data.filter_rows(hl.agg.any(variant_data.LGT.is_non_ref()))
+    if count_variants:
+        LOGGER.info(f"=== Total variants in VDS after non-reference filter: {variant_data.count_rows()}")
+    return hl.vds.VariantDataset(vds.reference_data, variant_data)
+
+
+def missing_sources(variant_data: hl.MatrixTable, annotation: Annotation) -> list[str]:
+    entry_fields = set(variant_data.entry)
+    gvcf_info_fields = set(variant_data.gvcf_info) if "gvcf_info" in variant_data.entry else set()
+    return [
+        source
+        for source in annotation.sources
+        if source not in entry_fields and (source in LOCAL_FIELDS or source not in gvcf_info_fields)
+    ]
+
+
+def resolve_annotations(
+    variant_data: hl.MatrixTable,
+    requested: Sequence[str],
+    strict: bool,
+) -> tuple[Annotation, ...]:
+    """Return the requested annotations whose sources exist, in registry order. GT is always included."""
+    wanted = {"GT", *requested}
+    resolved: list[Annotation] = []
+    errors: list[str] = []
+    for annotation in ANNOTATIONS:
+        if annotation.name not in wanted:
+            continue
+        missing = missing_sources(variant_data, annotation)
+        if not missing:
+            resolved.append(annotation)
+        elif strict or annotation.name == "GT":
+            errors.append(f"{annotation.name} (missing: {', '.join(missing)})")
+        else:
+            LOGGER.warning("Skipping annotation %s: missing source field(s) %s", annotation.name, ", ".join(missing))
+    if errors:
+        raise ValueError(
+            "Cannot build the requested annotation(s), source fields are not in the VDS variant data: "
+            + "; ".join(errors)
         )
+    return tuple(resolved)
+
+
+def entry_source(mt: hl.MatrixTable, field: str) -> hl.Expression:
+    # Same lookup rule as gnomAD's _get_info_agg_expr: top-level entry field wins over gvcf_info.
+    if field in mt.entry:
+        return mt[field]
+    return mt.gvcf_info[field]
+
+
+def local_to_global_expr(mt: hl.MatrixTable, name: str) -> hl.Expression:
+    n_alleles = hl.len(mt.alleles)
+    if name == "GT":
+        return hl.vds.lgt_to_gt(mt.LGT, mt.LA)
+    if name == "PGT":
+        return hl.vds.lgt_to_gt(mt.LPGT, mt.LA)
+    if name == "AD":
+        return hl.vds.local_to_global(mt.LAD, mt.LA, n_alleles, fill_value=0, number="R")
+    if name == "PL":
+        return hl.vds.local_to_global(mt.LPL, mt.LA, n_alleles, fill_value=hl.missing(hl.tint32), number="G")
+    raise ValueError(f"No local-to-global builder for {name}")
+
+
+def annotate_genotype_entries(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.MatrixTable:
+    names = [a.name for a in annotations if a.group == "local_to_global"]
+    LOGGER.info("=== Building entry annotations from local fields: %s", ", ".join(names))
+    return mt.annotate_entries(**{name: local_to_global_expr(mt, name) for name in names})
+
+
+def fill_ref_dp(mt: hl.MatrixTable) -> hl.MatrixTable:
+    if "DP" not in mt.entry or "MIN_DP" not in mt.entry:
+        LOGGER.warning("Skipping --fill-ref-dp: DP and MIN_DP entry fields are both required")
+        return mt
+    LOGGER.info("=== Filling missing DP with MIN_DP")
+    return mt.annotate_entries(DP=hl.coalesce(mt.DP, mt.MIN_DP))
+
+
+def gnomad_agg_fields(annotations: Sequence[Annotation], inputs: dict[str, tuple[str, str]]) -> dict[str, list[str]]:
+    agg_fields: dict[str, list[str]] = {
+        "sum_agg_fields": [],
+        "int32_sum_agg_fields": [],
+        "median_agg_fields": [],
+        "array_sum_agg_fields": [],
+    }
+    for annotation in annotations:
+        argument, field = inputs[annotation.name]
+        if field not in agg_fields[argument]:
+            agg_fields[argument].append(field)
+    return agg_fields
+
+
+def site_info_expr(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.StructExpression:
+    from gnomad.utils.sparse_mt import get_site_info_expr
+
+    agg_fields = gnomad_agg_fields(annotations, SITE_INFO_INPUTS)
+    # Pass array fields as expressions so non-GATK SB entries can be masked: hl.agg.array_sum fails on arrays of
+    # different lengths. FS/SOR at sites with such entries are set to missing in info_value.
+    array_sum_agg_fields = {field: entry_source(mt, field) for field in agg_fields["array_sum_agg_fields"]}
+    if "SB" in array_sum_agg_fields:
+        sb = array_sum_agg_fields["SB"]
+        array_sum_agg_fields["SB"] = hl.or_missing(hl.len(sb) == GATK_SB_LENGTH, sb)
+    return get_site_info_expr(
+        mt,
+        sum_agg_fields=agg_fields["sum_agg_fields"],
+        int32_sum_agg_fields=agg_fields["int32_sum_agg_fields"],
+        median_agg_fields=agg_fields["median_agg_fields"],
+        array_sum_agg_fields=array_sum_agg_fields,
     )
-    variant_data = variant_data.annotate_entries(GT=hl.vds.lgt_to_gt(variant_data.LGT, variant_data.LA))
-    return variant_data
+
+
+def sb_is_gatk_expr(mt: hl.MatrixTable) -> hl.BooleanExpression:
+    # True when every non-ref SB at the site is in GATK notation; gnomAD sums SB over non-ref genotypes only.
+    sb = entry_source(mt, "SB")
+    return hl.agg.filter(mt.LGT.is_non_ref(), hl.agg.all(hl.is_missing(sb) | (hl.len(sb) == GATK_SB_LENGTH)))
+
+
+def as_info_expr(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.StructExpression:
+    from gnomad.utils.sparse_mt import get_as_info_expr
+
+    agg_fields = gnomad_agg_fields(annotations, AS_INFO_INPUTS)
+    return get_as_info_expr(
+        mt,
+        sum_agg_fields=agg_fields["sum_agg_fields"],
+        int32_sum_agg_fields=agg_fields["int32_sum_agg_fields"],
+        median_agg_fields=agg_fields["median_agg_fields"],
+        array_sum_agg_fields=agg_fields["array_sum_agg_fields"],
+        alt_alleles_range_array_field=ALT_ALLELES_RANGE_FIELD,
+        treat_fields_as_allele_specific=True,
+    )
+
+
+def qd_expr(mt: hl.MatrixTable) -> hl.Float64Expression:
+    # Port of generate_qc_annotations from annotate_vds.py, aggregated in place on the dense rows.
+    # PL is computed here from LPL/LA rather than taken from the PL entry annotation, so info.QD does not force
+    # PL into the output: the PL entry field is only kept when it was requested.
+    pl = hl.vds.local_to_global(mt.LPL, mt.LA, hl.len(mt.alleles), fill_value=hl.missing(hl.tint32), number="G")
+    lin = 10 ** (-pl / 10.0)
+    gp0 = lin[0] / hl.sum(lin)
+    non_ref = mt.LGT.is_non_ref()
+    qual = -10 * hl.agg.filter(non_ref, hl.agg.sum(hl.if_else(pl[0] > 3000, -300, hl.log10(gp0))))
+    non_ref_dp = hl.agg.filter(non_ref, hl.agg.sum(entry_source(mt, "DP")))
+    # Missing instead of inf/NaN when no depth is recorded on the non-ref genotypes.
+    return hl.or_missing(non_ref_dp > 0, hl.min(35, qual / non_ref_dp))
+
+
+def info_value(mt: hl.MatrixTable, annotation: Annotation) -> hl.Expression:
+    field = annotation.field
+    if annotation.group == "site_info":
+        value = mt[SITE_INFO_FIELD][field]
+    elif annotation.group == "as_info":
+        value = mt[AS_INFO_FIELD][field]
+    elif annotation.group == "call_stats":
+        value = mt[CALL_STATS_FIELD][field]
+        if field in ("AC", "AF"):
+            value = value[1:]  # one value per alt allele
+    elif annotation.group == "qd":
+        value = mt[QD_FIELD]
+    elif annotation.group == "db":
+        value = mt[DB_FIELD]
+    else:
+        raise ValueError(f"No info builder for {annotation.name}")
+
+    # SB not in GATK notation at this site: FS/SOR would be computed from partial counts, so leave them missing.
+    if field in ("FS", "SOR"):
+        value = hl.or_missing(mt[SB_IS_GATK_FIELD], value)
+    # Fisher's exact test gives NaN without strand-bias counts, store it as missing as annotate_vds.py does.
+    if field == "FS":
+        return hl.or_missing(~hl.is_nan(value), value)
+    if field == "AS_FS":
+        return value.map(lambda x: hl.or_missing(~hl.is_nan(x), x))
+    return value
+
+
+def annotate_info(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.MatrixTable:
+    info_annotations = [a for a in annotations if a.kind == "info"]
+    if not info_annotations:
+        return mt
+    LOGGER.info("=== Building row info annotations: %s", ", ".join(a.name for a in info_annotations))
+
+    def in_group(group: str) -> list[Annotation]:
+        return [a for a in info_annotations if a.group == group]
+
+    if in_group("as_info"):
+        mt = mt.annotate_rows(**{ALT_ALLELES_RANGE_FIELD: hl.range(1, hl.len(mt.alleles))})
+
+    # First aggregate each builder group once into a temporary row field, then pick the requested fields.
+    # This also drops gnomAD intermediates such as SB and AS_SB_TABLE.
+    aggregations: dict[str, hl.Expression] = {}
+    if in_group("site_info"):
+        aggregations[SITE_INFO_FIELD] = site_info_expr(mt, in_group("site_info"))
+        if any(a.field in ("FS", "SOR") for a in in_group("site_info")):
+            aggregations[SB_IS_GATK_FIELD] = sb_is_gatk_expr(mt)
+    if in_group("as_info"):
+        aggregations[AS_INFO_FIELD] = as_info_expr(mt, in_group("as_info"))
+    if in_group("call_stats"):
+        aggregations[CALL_STATS_FIELD] = hl.agg.call_stats(mt.GT, mt.alleles)
+    if in_group("qd"):
+        aggregations[QD_FIELD] = qd_expr(mt)
+    if in_group("db"):
+        aggregations[DB_FIELD] = hl.agg.any(hl.coalesce(entry_source(mt, "DB"), False))
+    mt = mt.annotate_rows(**aggregations)
+
+    mt = mt.annotate_rows(info=hl.struct(**{a.field: info_value(mt, a) for a in info_annotations}))
+    return mt.drop(*aggregations)
+
+
+def promote_passthrough_entries(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.MatrixTable:
+    # Copy only the requested gvcf_info fields; a top-level entry field of the same name is kept as is.
+    promoted = [a.name for a in annotations if a.group == "passthrough" and a.name not in mt.entry]
+    if not promoted:
+        return mt
+    LOGGER.info("=== Promoting gvcf_info field(s) to entries: %s", ", ".join(promoted))
+    return mt.annotate_entries(**{name: mt.gvcf_info[name] for name in promoted})
 
 
 def drop_existing_fields(mt: hl.MatrixTable, fields: Sequence[str]) -> hl.MatrixTable:
-    fields_to_drop = [field for field in fields if field in mt.row]
+    fields_to_drop = [field for field in fields if field in mt.row or field in mt.entry]
     if not fields_to_drop:
         return mt
-    LOGGER.info("=== Dropping MatrixTable row field(s): %s", ", ".join(fields_to_drop))
+    LOGGER.info("=== Dropping MatrixTable field(s): %s", ", ".join(fields_to_drop))
     return mt.drop(*fields_to_drop)
 
 
@@ -153,27 +486,32 @@ def matrix_table_from_vds(config: Config) -> hl.MatrixTable:
 
     vds = filter_vds_by_allele_count(vds, config.max_alleles, config.count_variants)
 
-    LOGGER.info("=== Annotating variant entries with AD and GT")
-    variant_data = annotate_variant_entries(vds)
-
-    LOGGER.info("=== Creating merged sparse MatrixTable")
-    # The ref_allele_function is required to provide a default value for the reference-only alleles.
-    # We remove reference alleles before export, so it's safe to use missing('str') here.
-    mt = hl.vds.to_merged_sparse_mt(
-        hl.vds.VariantDataset(vds.reference_data, variant_data),
-        ref_allele_function=lambda locus: hl.missing('str'),
-    )
-
-    LOGGER.info("=== Splitting multi-allelic sites")
-    mt = hl.split_multi_hts(mt)
-    if config.count_variants:
-        LOGGER.info(f"=== Total variants in MT after split_multi_hts {mt.count_rows()}")
-
     LOGGER.info("=== Filtering to sites with at least one non-reference genotype")
-    mt = mt.filter_rows(hl.agg.any(mt.GT.is_non_ref()))
-    if config.count_variants:
-        LOGGER.info(f"=== Total variants in MT after non-reference filter {mt.count_rows()}")
+    vds = filter_vds_to_non_ref_sites(vds, config.count_variants)
 
+    LOGGER.info("=== Checking source fields for annotations")
+    annotations = resolve_annotations(vds.variant_data, config.annotations, config.strict_annotations)
+
+    LOGGER.info("=== Creating dense MatrixTable")
+    mt = hl.vds.to_dense_mt(vds)
+    if config.count_variants:
+        LOGGER.info(f"=== Total variants in dense MT: {mt.count_rows()}")
+
+    if config.fill_ref_dp:
+        mt = fill_ref_dp(mt)
+
+    mt = annotate_genotype_entries(mt, annotations)
+    # Info aggregations need the local fields and gvcf_info, so they run before those are dropped.
+    mt = annotate_info(mt, annotations)
+    mt = promote_passthrough_entries(mt, annotations)
+
+    # Keep only the built entry annotations; this drops the local fields (LA, LGT, LAD, LPL, LPGT).
+    # gvcf_info is kept here and dropped below unless --keep-gvcf-info was given.
+    entry_fields = [a.name for a in annotations if a.kind == "entry"]
+    if "gvcf_info" in mt.entry:
+        entry_fields.append("gvcf_info")
+    mt = mt.select_entries(*entry_fields)
+    mt = drop_existing_fields(mt, [ALT_ALLELES_RANGE_FIELD])
     if config.drop_gvcf_info:
         mt = drop_existing_fields(mt, ["gvcf_info"])
 
@@ -202,7 +540,10 @@ def configure_logging() -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
-        description="Export a Hail VDS to a filtered sparse Hail MatrixTable.",
+        description=(
+            "Export a Hail VDS to a filtered, annotated dense Hail MatrixTable. "
+            "Multi-allelic sites are kept (not split)."
+        ),
     )
     parser.add_argument(
         "input_vds",
@@ -220,7 +561,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     parser.add_argument(
         "--reference-sequence",
         default=None,
-        help="Additional reference FASTA path or URI to register with Hail",
+        help="Optional reference FASTA path or URI to register with Hail. Not required by the export itself.",
     )
     parser.add_argument(
         "--tmp-dir",
@@ -243,10 +584,44 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         default=10,
         help="Keep only variants with this many total alleles or fewer. Default: 10.",
     )
+    annotation_group = parser.add_mutually_exclusive_group()
+    annotation_group.add_argument(
+        "--annotations",
+        type=annotation_list,
+        default=None,
+        metavar="FIELD[,FIELD...]",
+        help=(
+            "Comma-separated annotations to build. Entry fields are plain names (GT, AD), row INFO fields use "
+            "the prefix 'info.' (info.QD). Annotations given here fail if their source fields are missing. "
+            "Default: all annotations, skipping those whose source fields are missing."
+        ),
+    )
+    annotation_group.add_argument(
+        "--no-annotations",
+        action="store_true",
+        help="Build no annotations except GT, which is always built.",
+    )
+    parser.add_argument(
+        "--strict-annotations",
+        action="store_true",
+        help="Fail if a default annotation cannot be built instead of logging a warning and skipping it.",
+    )
+    parser.add_argument(
+        "--list-annotations",
+        action=ListAnnotationsAction,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="Print the available annotations with their required source fields and exit.",
+    )
+    parser.add_argument(
+        "--fill-ref-dp",
+        action="store_true",
+        help="Fill missing entry DP with MIN_DP (gnomAD convention). Changes info.DP. Default: False.",
+    )
     parser.add_argument(
         "--keep-gvcf-info",
         action="store_true",
-        help="Keep the gvcf_info row field in the output MatrixTable. Can cause issues with exporting VCFs. Default: False.",
+        help="Keep the gvcf_info entry field in the output MatrixTable. Can cause issues with exporting VCFs.",
     )
     parser.add_argument(
         "--count_variants",
@@ -265,6 +640,13 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     )
     args = parser.parse_args(argv)
 
+    if args.no_annotations:
+        annotations: tuple[str, ...] = ()
+    elif args.annotations is not None:
+        annotations = args.annotations
+    else:
+        annotations = DEFAULT_ANNOTATIONS
+
     return Config(
         input_vds=args.input_vds,
         output_mt=args.output_mt,
@@ -277,6 +659,10 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         count_variants=args.count_variants,
         overwrite=args.overwrite,
         describe=args.describe,
+        annotations=annotations,
+        # An explicitly requested list is always strict.
+        strict_annotations=args.strict_annotations or args.annotations is not None,
+        fill_ref_dp=args.fill_ref_dp,
     )
 
 
