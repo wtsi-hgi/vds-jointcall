@@ -33,7 +33,6 @@ AS_INFO_FIELD = "_as_info"
 CALL_STATS_FIELD = "_call_stats"
 QD_FIELD = "_qd"
 DB_FIELD = "_db"
-SB_IS_GATK_FIELD = "_sb_is_gatk"
 # GATK FORMAT/SB: [ref_fwd, ref_rev, alt_fwd, alt_rev]. Some callers write a fwd/rev pair per allele instead.
 GATK_SB_LENGTH = 4
 
@@ -300,6 +299,31 @@ def resolve_annotations(
     return tuple(resolved)
 
 
+def drop_non_gatk_sb_annotations(
+    variant_data: hl.MatrixTable,
+    annotations: tuple[Annotation, ...],
+    strict: bool,
+) -> tuple[Annotation, ...]:
+    """Drop every SB-based annotation unless all SB entries in the data follow the GATK 4-value notation."""
+    sb_annotations = [a for a in annotations if "SB" in a.sources]
+    if not sb_annotations:
+        return annotations
+    names = ", ".join(a.name for a in sb_annotations)
+    LOGGER.info("=== Checking that all SB entries follow GATK notation (%d values): %s", GATK_SB_LENGTH, names)
+    sb = entry_source(variant_data, "SB")
+    sb_lengths = variant_data.aggregate_entries(hl.agg.filter(hl.is_defined(sb), hl.agg.counter(hl.len(sb))))
+    non_gatk = {length: count for length, count in sb_lengths.items() if length != GATK_SB_LENGTH}
+    if not non_gatk:
+        # All SB annotations follow GATK format
+        return annotations
+    detail = ", ".join(f"{count} with {length} values" for length, count in sorted(non_gatk.items()))
+    message = f"SB entries not in GATK notation ({detail}), cannot build {names}"
+    if strict:
+        raise ValueError(message)
+    LOGGER.warning("Skipping annotation(s): %s", message)
+    return tuple(a for a in annotations if a not in sb_annotations)
+
+
 def entry_source(mt: hl.MatrixTable, field: str) -> hl.Expression:
     # Same lookup rule as gnomAD's _get_info_agg_expr: top-level entry field wins over gvcf_info.
     if field in mt.entry:
@@ -352,25 +376,17 @@ def site_info_expr(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.
     from gnomad.utils.sparse_mt import get_site_info_expr
 
     agg_fields = gnomad_agg_fields(annotations, SITE_INFO_INPUTS)
-    # Pass array fields as expressions so non-GATK SB entries can be masked: hl.agg.array_sum fails on arrays of
-    # different lengths. FS/SOR at sites with such entries are set to missing in info_value.
-    array_sum_agg_fields = {field: entry_source(mt, field) for field in agg_fields["array_sum_agg_fields"]}
-    if "SB" in array_sum_agg_fields:
-        sb = array_sum_agg_fields["SB"]
-        array_sum_agg_fields["SB"] = hl.or_missing(hl.len(sb) == GATK_SB_LENGTH, sb)
+    if [a.name for a in annotations] == ["info.DP"]:
+        # gnomAD wraps the non-DP fields in hl.agg.filter, which Hail rejects when that struct is empty.
+        # Same as its int32 DP sum over all genotypes.
+        return hl.struct(DP=hl.int32(hl.agg.sum(entry_source(mt, "DP"))))
     return get_site_info_expr(
         mt,
         sum_agg_fields=agg_fields["sum_agg_fields"],
         int32_sum_agg_fields=agg_fields["int32_sum_agg_fields"],
         median_agg_fields=agg_fields["median_agg_fields"],
-        array_sum_agg_fields=array_sum_agg_fields,
+        array_sum_agg_fields=agg_fields["array_sum_agg_fields"],
     )
-
-
-def sb_is_gatk_expr(mt: hl.MatrixTable) -> hl.BooleanExpression:
-    # True when every non-ref SB at the site is in GATK notation; gnomAD sums SB over non-ref genotypes only.
-    sb = entry_source(mt, "SB")
-    return hl.agg.filter(mt.LGT.is_non_ref(), hl.agg.all(hl.is_missing(sb) | (hl.len(sb) == GATK_SB_LENGTH)))
 
 
 def as_info_expr(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.StructExpression:
@@ -419,9 +435,6 @@ def info_value(mt: hl.MatrixTable, annotation: Annotation) -> hl.Expression:
     else:
         raise ValueError(f"No info builder for {annotation.name}")
 
-    # SB not in GATK notation at this site: FS/SOR would be computed from partial counts, so leave them missing.
-    if field in ("FS", "SOR"):
-        value = hl.or_missing(mt[SB_IS_GATK_FIELD], value)
     # Fisher's exact test gives NaN without strand-bias counts, store it as missing as annotate_vds.py does.
     if field == "FS":
         return hl.or_missing(~hl.is_nan(value), value)
@@ -447,8 +460,6 @@ def annotate_info(mt: hl.MatrixTable, annotations: Sequence[Annotation]) -> hl.M
     aggregations: dict[str, hl.Expression] = {}
     if in_group("site_info"):
         aggregations[SITE_INFO_FIELD] = site_info_expr(mt, in_group("site_info"))
-        if any(a.field in ("FS", "SOR") for a in in_group("site_info")):
-            aggregations[SB_IS_GATK_FIELD] = sb_is_gatk_expr(mt)
     if in_group("as_info"):
         aggregations[AS_INFO_FIELD] = as_info_expr(mt, in_group("as_info"))
     if in_group("call_stats"):
@@ -491,6 +502,7 @@ def matrix_table_from_vds(config: Config) -> hl.MatrixTable:
 
     LOGGER.info("=== Checking source fields for annotations")
     annotations = resolve_annotations(vds.variant_data, config.annotations, config.strict_annotations)
+    annotations = drop_non_gatk_sb_annotations(vds.variant_data, annotations, config.strict_annotations)
 
     LOGGER.info("=== Creating dense MatrixTable")
     mt = hl.vds.to_dense_mt(vds)

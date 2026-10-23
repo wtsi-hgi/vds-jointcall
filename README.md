@@ -118,7 +118,7 @@ Source fields are looked up as top-level VDS variant entry fields or inside `gvc
 | `info.DP` | `DP` | Sum over all genotypes |
 | `info.ReadPosRankSum`, `info.MQRankSum`, `info.BaseQRankSum` | same name | Median over non-ref genotypes |
 | `info.MQ` | `RAW_MQandDP` | |
-| `info.FS`, `info.SOR` | `SB` | Missing at sites where a non-ref `SB` is not in GATK notation (4 values) |
+| `info.FS`, `info.SOR` | `SB` | Skipped, together with the `SB` entry, if any `SB` entry is not in GATK notation (4 values) |
 | `info.AS_MQ` | `AS_RAW_MQ`, `LAD`, `LA` | Per alt allele |
 | `info.AS_ReadPosRankSum`, `info.AS_MQRankSum` | `AS_RAW_ReadPosRankSum` / `AS_RAW_MQRankSum`, `LA` | Per alt allele |
 | `info.AS_QD` | `AS_QD`, `LA` | Per alt allele |
