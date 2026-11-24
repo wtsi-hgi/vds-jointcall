@@ -105,6 +105,8 @@ python3 vds-to-mt.py path/to/input.vds path/to/output.mt --annotations AD,DP,GQ,
 - `--no-annotations` builds only `GT`.
 - `--list-annotations` prints all annotations with their required source fields and exits.
 - `--fill-ref-dp` fills missing `DP` with `MIN_DP` (gnomAD convention); this changes `info.DP`.
+- `PL` of hom-ref reference-block entries is filled by default as `[0, MIN_GQ, MIN_GQ, ...]` (`GQ` if
+  `MIN_GQ` is missing), an approximation derived from the block's GQ. `--no-fill-ref-pl` keeps it missing.
 
 Source fields are looked up as top-level VDS variant entry fields or inside `gvcf_info`.
 
@@ -112,7 +114,7 @@ Source fields are looked up as top-level VDS variant entry fields or inside `gvc
 |------------|------------------|-------|
 | `GT` | `LGT`, `LA` | Always built |
 | `AD` | `LAD`, `LA` | Global allele indices, missing for hom-ref entries |
-| `PL` | `LPL`, `LA` | Global allele indices, missing for hom-ref entries |
+| `PL` | `LPL`, `LA` | Global allele indices. Genotypes with alleles the sample did not have get `999`. Hom-ref reference-block entries get `[0, MIN_GQ, ...]` unless `--no-fill-ref-pl`; no-call entries stay missing |
 | `PGT` | `LPGT`, `LA` | GATK only |
 | `DP`, `GQ`, `MIN_DP`, `PID`, `PS`, `RGQ`, `SB` | same name | Copied from the entry, or from `gvcf_info` |
 | `info.DP` | `DP` | Sum over all genotypes |

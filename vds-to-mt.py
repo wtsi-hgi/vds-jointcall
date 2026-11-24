@@ -35,6 +35,9 @@ QD_FIELD = "_qd"
 DB_FIELD = "_db"
 # GATK FORMAT/SB: [ref_fwd, ref_rev, alt_fwd, alt_rev]. Some callers write a fwd/rev pair per allele instead.
 GATK_SB_LENGTH = 4
+# PL for genotypes with alleles absent from a sample's local alleles (LA): the caller saw no evidence for them,
+# so they get a large value ("effectively impossible"), as in Hail's local_to_global documentation example.
+UNSEEN_ALLELE_PL = 999
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,6 +124,7 @@ class Config:
     annotations: tuple[str, ...]
     strict_annotations: bool
     fill_ref_dp: bool
+    fill_ref_pl: bool
 
 
 def positive_int(value: str) -> int:
@@ -340,7 +344,7 @@ def local_to_global_expr(mt: hl.MatrixTable, name: str) -> hl.Expression:
     if name == "AD":
         return hl.vds.local_to_global(mt.LAD, mt.LA, n_alleles, fill_value=0, number="R")
     if name == "PL":
-        return hl.vds.local_to_global(mt.LPL, mt.LA, n_alleles, fill_value=hl.missing(hl.tint32), number="G")
+        return hl.vds.local_to_global(mt.LPL, mt.LA, n_alleles, fill_value=UNSEEN_ALLELE_PL, number="G")
     raise ValueError(f"No local-to-global builder for {name}")
 
 
@@ -356,6 +360,28 @@ def fill_ref_dp(mt: hl.MatrixTable) -> hl.MatrixTable:
         return mt
     LOGGER.info("=== Filling missing DP with MIN_DP")
     return mt.annotate_entries(DP=hl.coalesce(mt.DP, mt.MIN_DP))
+
+
+def fill_ref_pl(mt: hl.MatrixTable) -> hl.MatrixTable:
+    """Fill PL of hom-ref reference-block cells as [0, q, q, ...] with q = MIN_GQ (or GQ if MIN_GQ is missing).
+
+    The VDS combiner does not keep PL for reference blocks. GQ is the gap to the closest non-ref genotype, so using
+    it for every non-ref genotype is a lower bound: it can understate confidence but never overstate it. MIN_GQ is
+    the lowest GQ within the block, so it is valid at every position the block covers.
+    """
+    gq_fields = [field for field in ("MIN_GQ", "GQ") if field in mt.entry]
+    if not gq_fields or "LA" not in mt.entry:
+        LOGGER.warning("Skipping reference-block PL fill: LA and MIN_GQ or GQ entry fields are required")
+        return mt
+    LOGGER.info("=== Filling PL of hom-ref reference-block entries from %s", " or ".join(gq_fields))
+    q = hl.coalesce(*(mt[field] for field in gq_fields))
+    n_alleles = hl.len(mt.alleles)
+    n_genotypes = hl.if_else(mt.GT.ploidy == 1, n_alleles, n_alleles * (n_alleles + 1) // 2)
+    # In the dense MatrixTable only reference-block cells lack LA: the combiner sets it on every variant entry.
+    # No-call blocks (missing GT) and cells without coverage keep PL missing.
+    is_ref_block = hl.is_missing(mt.LA) & hl.coalesce(mt.GT.is_hom_ref(), False) & hl.is_defined(q)
+    ref_pl = hl.range(n_genotypes).map(lambda i: hl.if_else(i == 0, 0, q))
+    return mt.annotate_entries(PL=hl.if_else(is_ref_block, ref_pl, mt.PL))
 
 
 def gnomad_agg_fields(annotations: Sequence[Annotation], inputs: dict[str, tuple[str, str]]) -> dict[str, list[str]]:
@@ -513,6 +539,9 @@ def matrix_table_from_vds(config: Config) -> hl.MatrixTable:
         mt = fill_ref_dp(mt)
 
     mt = annotate_genotype_entries(mt, annotations)
+    # Runs before select_entries, which drops LA and MIN_GQ.
+    if config.fill_ref_pl and "PL" in mt.entry:
+        mt = fill_ref_pl(mt)
     # Info aggregations need the local fields and gvcf_info, so they run before those are dropped.
     mt = annotate_info(mt, annotations)
     mt = promote_passthrough_entries(mt, annotations)
@@ -626,9 +655,17 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         help="Print the available annotations with their required source fields and exit.",
     )
     parser.add_argument(
-        "--fill-ref-dp",
+        "--no-fill-ref-dp",
         action="store_true",
-        help="Fill missing entry DP with MIN_DP (gnomAD convention). Changes info.DP. Default: False.",
+        help="Keep entry DP missing and do not fill it with with MIN_DP (gnomAD convention). Changes info.DP. Default: False.",
+    )
+    parser.add_argument(
+        "--no-fill-ref-pl",
+        action="store_true",
+        help=(
+            "Keep PL missing for hom-ref reference-block entries. By default it is filled as [0, MIN_GQ, MIN_GQ, ...] "
+            "(GQ if MIN_GQ is missing), an approximation derived from the block's GQ."
+        ),
     )
     parser.add_argument(
         "--keep-gvcf-info",
@@ -674,7 +711,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         annotations=annotations,
         # An explicitly requested list is always strict.
         strict_annotations=args.strict_annotations or args.annotations is not None,
-        fill_ref_dp=args.fill_ref_dp,
+        fill_ref_dp=not args.no_fill_ref_dp,
+        fill_ref_pl=not args.no_fill_ref_pl,
     )
 
 
